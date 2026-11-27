@@ -587,6 +587,8 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
 /// # Safety
 /// See [`report_unhandled`].
 unsafe fn report_once(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
+    #[cfg(test)]
+    tests::REPORTED.with(|n| n.set(n.get() + 1));
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
     let code = record.ExceptionCode;
@@ -1079,7 +1081,10 @@ fn module_of(address: usize) -> Option<String> {
     let len = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
     let path = String::from_utf16_lossy(&path[..len as usize]);
     let name = path.rsplit('\\').next().unwrap_or(&path);
-    Some(format!("{name}+{:#x}", address - module as usize))
+    // Wine 11.21 answers for an address in no image too, with a module
+    // above it; that address is shown bare.
+    let offset = address.checked_sub(module as usize)?;
+    Some(format!("{name}+{offset:#x}"))
 }
 
 /// What is at `address`, for an access violation there: nothing, memory
@@ -1902,6 +1907,75 @@ mod tests {
             end.copy_from_nonoverlapping(code.as_ptr(), 3);
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
+
+    thread_local! {
+        /// Reports this thread made ([`report_once`]).
+        pub(super) static REPORTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The page [`reopen`] gives back to a read that faulted on it.
+    static UNREADABLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// After our handlers: a read of [`UNREADABLE`] finds the page readable
+    /// again and goes on.
+    unsafe extern "system" fn reopen(info: *mut EXCEPTION_POINTERS) -> i32 {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        // SAFETY: the system passes valid exception pointers.
+        let record = unsafe { &*(*info).ExceptionRecord };
+        let page = UNREADABLE.load(std::sync::atomic::Ordering::SeqCst);
+        let hit = record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+            && page != 0
+            && record.ExceptionInformation[1] & !0xfff == page;
+        let mut old = 0;
+        // SAFETY: our own page.
+        if hit && unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old) } != 0 {
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    #[test]
+    fn a_fault_while_reporting_is_not_reported_again() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree,
+        };
+        report_crashes();
+        // SAFETY: a fresh page of ours, unreadable; a handler after ours,
+        // removed at the end.
+        unsafe {
+            let page = VirtualAlloc(
+                std::ptr::null(),
+                0x1000,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_NOACCESS,
+            );
+            assert!(!page.is_null());
+            UNREADABLE.store(page as usize, std::sync::atomic::Ordering::SeqCst);
+            let after = AddVectoredExceptionHandler(0, Some(reopen));
+            assert!(!after.is_null());
+            // An illegal instruction on that page: the report reads its
+            // bytes, and that read faults inside the report.
+            let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+            record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+            record.ExceptionAddress = page;
+            let mut context: CONTEXT = std::mem::zeroed();
+            let pointers = EXCEPTION_POINTERS {
+                ExceptionRecord: &mut record,
+                ContextRecord: &mut context,
+            };
+            REPORTED.with(|n| n.set(0));
+            report("synthetic exception", &pointers, false);
+            // Only the synthetic exception was reported: the fault inside
+            // its report went on to `reopen` unreported.
+            assert_eq!(REPORTED.with(|n| n.get()), 1);
+            RemoveVectoredExceptionHandler(after);
+            UNREADABLE.store(0, std::sync::atomic::Ordering::SeqCst);
+            VirtualFree(page, 0, MEM_RELEASE);
         }
     }
 }
