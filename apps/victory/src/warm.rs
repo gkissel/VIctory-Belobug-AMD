@@ -54,10 +54,18 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     if let Some(these) = these {
         return make(&dir, &these);
     }
+    // A shared application library must have one writer. Ordinary warming
+    // only populates the driver's cache and can keep using many processes.
+    let save_library = std::env::var_os("VICTORY_WARM_LIBRARY").is_some_and(|v| v == "1");
+    if save_library && jobs != Some(1) {
+        anyhow::bail!("VICTORY_WARM_LIBRARY=1 requires --jobs 1 to preserve every library update");
+    }
     let began = Instant::now();
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
-    let done_file = dir.join("warm-done.txt");
+    // Driver-only warming does not populate the application's library.
+    // Keep its completions separate so switching modes cannot skip that work.
+    let done_file = dir.join(if save_library { "warm-library-done.txt" } else { "warm-done.txt" });
     let bad_file = dir.join(known::WARM_BAD_FILE);
     let keys = known::keys(&dir);
     let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
@@ -77,6 +85,13 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     };
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
+    if used {
+        let recorded: HashSet<&str> = keys.iter().map(String::as_str).collect();
+        let missing = early.iter().filter(|key| !recorded.contains(**key)).count();
+        if missing > 0 {
+            tracing::warn!(missing, "requested pipelines missing from the book cannot be warmed; record them with VICTORY_PIPELINE_BOOK=1");
+        }
+    }
     let all = select_pipelines(&keys, &done, &bad, &early, again, used, limit);
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
@@ -92,7 +107,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
-    run_batches(
+    run_batches_with_retry(
         &all,
         jobs,
         start_worker,
@@ -115,6 +130,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             let _ = writeln!(lock(&bad_out), "{}", known::format_bad_entry(&keys[n], &fingerprint, &why));
             lock(&state).2 += 1;
         },
+        save_library,
     )?;
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
     times.sort_by(f64::total_cmp);
@@ -132,6 +148,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     Ok(())
 }
 
+#[cfg(test)]
 fn run_batches(
     all: &[usize],
     jobs: usize,
@@ -139,7 +156,21 @@ fn run_batches(
     each: impl Fn(usize, f64, bool) + Sync,
     bad: impl Fn(usize, String) + Sync,
 ) -> Result<()> {
-    let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
+    run_batches_with_retry(all, jobs, start, each, bad, false)
+}
+
+fn run_batches_with_retry(
+    all: &[usize],
+    jobs: usize,
+    start: impl Fn(&[usize]) -> Result<Child> + Sync,
+    each: impl Fn(usize, f64, bool) + Sync,
+    bad: impl Fn(usize, String) + Sync,
+    retry_failed_batch: bool,
+) -> Result<()> {
+    // Application-library warming keeps one writer. Larger batches avoid
+    // repeatedly opening Wine, the device and the growing mapped library.
+    let at_once = if retry_failed_batch { 400 } else { AT_ONCE };
+    let chunks: Vec<&[usize]> = all.chunks(at_once).collect();
     let next = AtomicUsize::new(0);
     // Stop launching workers after a setup failure. In-flight workers can still report.
     let failure = OnceLock::new();
@@ -148,15 +179,23 @@ fn run_batches(
             s.spawn(|| {
                 while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let mut rest = chunk;
+                    let mut one_at_a_time = false;
                     while !rest.is_empty() {
                         if failure.get().is_some() {
                             return;
                         }
-                        let outcome = start(rest)
+                        let attempt = if one_at_a_time { &rest[..1] } else { rest };
+                        let outcome = start(attempt)
                             .context("could not start warm worker")
                             .and_then(|process| child(process, &each));
                         match outcome {
                             Ok(Some((made, why))) => {
+                                if retry_failed_batch && !one_at_a_time && attempt.len() > 1 {
+                                    tracing::warn!(%why, "warm batch failed; retrying each remaining pipeline before quarantine");
+                                    rest = &rest[made.min(rest.len())..];
+                                    one_at_a_time = true;
+                                    continue;
+                                }
                                 let remaining = &rest[made.min(rest.len())..];
                                 let Some((&n, after)) = remaining.split_first() else {
                                     break;
@@ -164,7 +203,7 @@ fn run_batches(
                                 bad(n, why);
                                 rest = after;
                             }
-                            Ok(None) => break,
+                            Ok(None) => rest = &rest[attempt.len()..],
                             Err(error) => {
                                 let _ = failure.set(error);
                                 return;
@@ -341,6 +380,28 @@ mod tests {
         assert_eq!(bad.len(), 1);
         assert_eq!(bad[0].0, 8);
         assert!(!bad[0].1.is_empty());
+    }
+
+    #[test]
+    fn parallel_batch_failure_retries_each_key_before_quarantine() {
+        let done = Mutex::new(Vec::new());
+        let bad = Mutex::new(Vec::new());
+        run_batches_with_retry(
+            &[7, 8, 9],
+            1,
+            |rest| match rest {
+                [7, 8, 9] => fake_child("exit /b 7", Stdio::piped()),
+                [7] => fake_child("echo made 7 3.5 1", Stdio::piped()),
+                [8] => fake_child("exit /b 7", Stdio::piped()),
+                [9] => fake_child("echo made 9 2.0 1", Stdio::piped()),
+                _ => panic!("unexpected retry {rest:?}"),
+            },
+            |n, _, _| lock(&done).push(n),
+            |n, _| lock(&bad).push(n),
+            true,
+        ).unwrap();
+        assert_eq!(*lock(&done), [7, 9]);
+        assert_eq!(*lock(&bad), [8]);
     }
 
     #[test]

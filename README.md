@@ -136,6 +136,20 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
+Experimental application-library warming is available with
+`VICTORY_WARM_LIBRARY=1` and `warm --used --jobs 1`. It uses one file writer
+and up to four compiler threads, and keeps its completion list in
+`warm-library-done.txt`, separate from driver-only warming. Do not run another
+writer against the same cache folder at the same time. Failed parallel batches
+are retried individually before a pipeline is quarantined.
+
+Under vkd3d-proton, `VKD3D_SHADER_CACHE_PATH=0` selects application-only caching;
+use the same setting when warming and running if native pipeline blobs are
+wanted in this library. Drivers can still spend time creating pipelines from
+cached data. This experimental mode does not establish playable performance or
+correct rendering, and persistence errors still use the library's existing
+warning path.
+
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.

@@ -75,6 +75,12 @@ impl Pending {
         &self.key
     }
 
+    /// Offline warming uses the same immutable state without joining the
+    /// title's queue. Pending already owns the strings its input elements use.
+    pub(super) fn warm_host(&self) -> bool {
+        HostPipeline::new(&self.shaders, self.graphics.as_deref()).is_some()
+    }
+
     fn make(&self) {
         // Not through `OnceLock::get_or_init`: a worker the driver's compiler
         // crashed under stays inside the call for good (see [`guard_start`]),
