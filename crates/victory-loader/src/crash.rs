@@ -568,6 +568,25 @@ unsafe fn thrown(p: &[usize]) -> String {
 /// # Safety
 /// See [`report_unhandled`].
 unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
+    thread_local! {
+        static REPORTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    // A fault while this thread reports one reaches the handlers again, and
+    // reporting that one faults the same way: the thread recursed until its
+    // stack ran out, and the first report was lost with it. The nested
+    // exception goes on unreported. A report that never returns leaves the
+    // flag set, so that thread reports nothing more.
+    if REPORTING.try_with(|r| r.replace(true)).unwrap_or(true) {
+        return;
+    }
+    // SAFETY: forwarded from the caller.
+    unsafe { report_once(what, info, to_file) };
+    let _ = REPORTING.try_with(|r| r.set(false));
+}
+
+/// # Safety
+/// See [`report_unhandled`].
+unsafe fn report_once(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     // SAFETY: the system passes valid exception pointers.
     let (record, context) = unsafe { (&*(*info).ExceptionRecord, &*(*info).ContextRecord) };
     let code = record.ExceptionCode;
