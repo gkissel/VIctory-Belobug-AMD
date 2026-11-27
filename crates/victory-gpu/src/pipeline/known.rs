@@ -330,6 +330,14 @@ pub fn use_translations(dir: PathBuf) {
 /// the number before, and what came of it after: milliseconds and whether
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
+    // Opt-in application-cache warming. The CLI requires one worker so
+    // each batch loads the preceding batch's library before appending to it.
+    // With vkd3d-proton's application-only cache this also persists native
+    // pipeline binaries, rather than relying on the driver's disk cache.
+    let save_library = std::env::var_os("VICTORY_WARM_LIBRARY").is_some_and(|v| v == "1");
+    if save_library {
+        super::library::use_pipeline_cache(dir.to_path_buf());
+    }
     let mut places = HashMap::new();
     walk_shaders(dir, |stage, hash, at, len| { let _ = places.insert(hash, (stage, at, len)); });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
@@ -347,6 +355,54 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         file.read_exact(&mut bytes).ok()?;
         Some(bytes)
     };
+    if save_library {
+        // One process owns the file, while a few threads compile independent
+        // pipelines through the library's existing per-entry synchronization.
+        let work: Vec<_> = which.iter().filter_map(|n| {
+            entries.get(n).map(|entry| {
+                (*n, parse(entry, &mut read).map(|(shaders, g)| super::make::Pending::new(shaders, g)))
+            })
+        }).collect();
+        crate::descriptor::host::probe_view_limit();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (send, receive) = std::sync::mpsc::channel();
+        let mut results = HashMap::new();
+        std::thread::scope(|scope| {
+            for _ in 0..work.len().min(4) {
+                let (work, next, send) = (&work, &next, send.clone());
+                scope.spawn(move || {
+                    while let Some((n, pipeline)) = work.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                        if send.send((*n, None)).is_err() {
+                            return;
+                        }
+                        let began = std::time::Instant::now();
+                        let made = pipeline.as_ref().is_some_and(|p| p.warm_host());
+                        let outcome = (began.elapsed().as_secs_f64() * 1e3, made);
+                        if send.send((*n, Some(outcome))).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+            drop(send);
+            for (n, outcome) in receive {
+                match outcome {
+                    Some(outcome) => { results.insert(n, outcome); }
+                    None => each(n, None),
+                }
+            }
+        });
+        super::library::save(true);
+        // Report completions in input order, after persistence. If a native
+        // compiler ends the process, the parent retries the batch one by one
+        // before deciding which pipeline failed.
+        for n in which {
+            if let Some(outcome) = results.remove(n) {
+                each(*n, Some(outcome));
+            }
+        }
+        return;
+    }
     for n in which {
         let Some(entry) = entries.get(n) else { continue };
         each(*n, None);
