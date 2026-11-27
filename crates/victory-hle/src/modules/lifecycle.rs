@@ -203,6 +203,12 @@ fn borderless(parent: HWND, ex_style: u32, style: u32) -> (u32, u32) {
     if !parent.is_null() || !fullscreen() {
         return (ex_style, style);
     }
+    popup_styles(ex_style, style)
+}
+
+/// A window's styles with its frame (caption, borders, sizing, system
+/// menu, edges) taken away and `WS_POPUP` added; every other flag kept.
+fn popup_styles(ex_style: u32, style: u32) -> (u32, u32) {
     let frame = wm::WS_OVERLAPPEDWINDOW;
     let ex_frame = wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_DLGMODALFRAME;
     (ex_style & !ex_frame, (style & !frame) | wm::WS_POPUP)
@@ -596,6 +602,32 @@ mod tests {
             "2147483648x1080",
         ] {
             assert_eq!(parse_window_limit(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn popup_styles_drop_only_the_frame() {
+        let kept = wm::WS_VISIBLE | wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS;
+        let ex_kept = wm::WS_EX_APPWINDOW | wm::WS_EX_ACCEPTFILES;
+        let ex_frame = wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_DLGMODALFRAME;
+        let (ex_style, style) = popup_styles(ex_kept | ex_frame, kept | wm::WS_OVERLAPPEDWINDOW);
+        assert_eq!(style, kept | wm::WS_POPUP);
+        assert_eq!(ex_style, ex_kept);
+        // A window without a frame only gains WS_POPUP.
+        assert_eq!(popup_styles(ex_kept, kept), (ex_kept, kept | wm::WS_POPUP));
+        // Each frame bit goes on its own, too.
+        for bit in [
+            wm::WS_CAPTION,
+            wm::WS_SYSMENU,
+            wm::WS_THICKFRAME,
+            wm::WS_MINIMIZEBOX,
+            wm::WS_MAXIMIZEBOX,
+        ] {
+            assert_eq!(
+                popup_styles(0, kept | bit).1,
+                kept | wm::WS_POPUP,
+                "{bit:#x}"
+            );
         }
     }
 
