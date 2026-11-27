@@ -268,6 +268,10 @@ limits them. This scales the displayed image; it does not change the
 console render resolution or the swap-chain buffers. With the variable
 unset, window sizing is unchanged.
 
+Set `VICTORY_FULLSCREEN=1` to make the title's top-level window a
+borderless window covering the whole primary screen instead. The image is
+scaled to it the same way.
+
 Input: XInput pads. With none connected the keyboard is a pad while the
 title's window has focus:
 

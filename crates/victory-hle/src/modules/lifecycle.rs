@@ -111,6 +111,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style) = borderless(parent, ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -137,6 +138,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, style) = borderless(parent, ex_style, style);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -154,6 +156,24 @@ pub extern "system" fn CreateWindowExA(
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    if parent.is_null() && fullscreen() {
+        // SAFETY: plain queries.
+        let (w, h) = unsafe {
+            (
+                wm::GetSystemMetrics(wm::SM_CXSCREEN),
+                wm::GetSystemMetrics(wm::SM_CYSCREEN),
+            )
+        };
+        if w > 0 && h > 0 {
+            tracing::info!(
+                width,
+                height,
+                to = ?(w, h),
+                "title window covers the screen (VICTORY_FULLSCREEN)"
+            );
+            return (0, 0, w, h);
+        }
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -168,6 +188,24 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// `VICTORY_FULLSCREEN=1`: the title's top-level window is a borderless
+/// window over the whole primary screen (the swap chain is stretched to it,
+/// as with [`fit`]); off by default.
+fn fullscreen() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FULLSCREEN").is_some_and(|v| v == "1"))
+}
+
+/// With [`fullscreen`], a top-level window's frame styles become a popup's.
+fn borderless(parent: HWND, ex_style: u32, style: u32) -> (u32, u32) {
+    if !parent.is_null() || !fullscreen() {
+        return (ex_style, style);
+    }
+    let frame = wm::WS_OVERLAPPEDWINDOW;
+    let ex_frame = wm::WS_EX_WINDOWEDGE | wm::WS_EX_CLIENTEDGE | wm::WS_EX_DLGMODALFRAME;
+    (ex_style & !ex_frame, (style & !frame) | wm::WS_POPUP)
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
